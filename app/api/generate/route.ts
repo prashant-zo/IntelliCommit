@@ -4,23 +4,22 @@ import { NextResponse } from "next/server";
 // ================================================================
 
 // AI Provider URLs
-// Primary HF model + fallbacks (token required)
+// HF Inference Providers (new router - replaces deprecated api-inference.huggingface.co)
+const HF_ROUTER_URL = "https://router.huggingface.co/v1/chat/completions";
 const HUGGING_FACE_MODEL_ORDER = [
-  "Qwen/Qwen2.5-7B-Instruct",  // Not gated - should work
-  "microsoft/DialoGPT-medium",  // Fallback
-  "gpt2"                        // Fallback
+  "meta-llama/Llama-3.2-3B-Instruct",   // Free tier friendly
+  "google/gemma-2-2b-it",               // Small, cheap
+  "Qwen/Qwen2.5-7B-Instruct",           // Good quality
+  "mistralai/Mistral-7B-Instruct-v0.3"  // Fallback
 ];
-// Default points to first in the order
-const HUGGING_FACE_API_URL = `https://api-inference.huggingface.co/models/${HUGGING_FACE_MODEL_ORDER[0]}`;
 const OPENAI_API_URL = "https://api.openai.com/v1/chat/completions";
-const GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent";
-const AIML_API_URL = "https://api.aimlapi.com/chat/completions";
+const GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
+const AIML_API_URL = "https://api.aimlapi.com/v1/chat/completions";
 
-// Free Hugging Face Models (No API key required)
+// Free/cheap HF models (uses HF token - $0.10 free credits/month)
 const FREE_HF_MODELS = [
-  "microsoft/DialoGPT-medium",
-  "gpt2",
-  "distilgpt2"
+  "google/gemma-2-2b-it",
+  "meta-llama/Llama-3.2-3B-Instruct"
 ];
 
 // 🧠 INTELLIGENT PROVIDER HEALTH MONITORING
@@ -43,11 +42,26 @@ const providerHealth: Record<string, ProviderHealth> = {
   local: { name: 'LocalAI', isHealthy: true, successRate: 1.0, avgResponseTime: 100, lastSuccess: Date.now(), consecutiveFailures: 0, priority: 6 }
 };
 
-// Cooldowns for providers (e.g., OpenAI 429)
+// Cooldowns for providers (e.g., OpenAI/Gemini 429 rate limit)
 const providerCooldownUntil: Record<string, number> = {};
+const COOLDOWN_429_MS = 5 * 60 * 1000; // 5 minutes
+
+// Diff analysis shape (from analyzeDiff)
+type DiffAnalysis = {
+  fileName: string;
+  fileExtension?: string;
+  addedLines?: number;
+  removedLines?: number;
+  totalChanges?: number;
+  fileCount?: number;
+  changeType: string;
+  confidence?: number;
+  complexity?: string;
+  patterns?: string[];
+};
 
 // 🎯 INTELLIGENT CACHING SYSTEM
-const responseCache = new Map<string, { response: string, timestamp: number, analysis: any }>();
+const responseCache = new Map<string, { response: string; timestamp: number; analysis: DiffAnalysis }>();
 const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 
 // Configuration
@@ -55,7 +69,6 @@ const AIML_TIMEOUT = 8000;
 const OPENAI_TIMEOUT = 8000;
 const GEMINI_TIMEOUT = 8000;
 const HF_TIMEOUT = 20000; // HF can cold-start
-const FALLBACK_TO_LOCAL = true;
 const MAX_RETRIES = 2;
 const CIRCUIT_BREAKER_THRESHOLD = 3;
 
@@ -91,13 +104,23 @@ export async function POST(req: Request) {
     const analysis = analyzeDiff(safeDiff);
     
     // 🚀 PARALLEL AI EXECUTION WITH SMART ROUTING
-    const { result: commitMessage, provider: usedProvider } = await executeIntelligentAIStrategy(safeDiff, analysis);
-    
+    const { result: rawMessage, provider: usedProvider } = await executeIntelligentAIStrategy(safeDiff, analysis);
+
+    // 📤 OUTPUT: API → sanitize. Local → use as-is (already structured, no sanitizer).
+    let commitMessage: string;
+    let finalAnalysis = analysis;
+    if (usedProvider === 'local') {
+      commitMessage = rawMessage;
+      finalAnalysis = { ...analysis, ...getLocalAnalysis(safeDiff) };
+    } else {
+      commitMessage = sanitizeCommitMessage(rawMessage, safeDiff);
+    }
+
     // 💾 CACHE THE RESPONSE
     responseCache.set(cacheKey, {
       response: commitMessage,
       timestamp: Date.now(),
-      analysis: analysis
+      analysis: finalAnalysis
     });
 
     // 🎯 CLEANUP OLD CACHE ENTRIES
@@ -106,12 +129,12 @@ export async function POST(req: Request) {
     return NextResponse.json({
       commitMessage,
       analysis: {
-        complexity: analysis.complexity,
-        changeType: analysis.changeType,
-        confidence: analysis.confidence,
+        complexity: finalAnalysis.complexity,
+        changeType: finalAnalysis.changeType,
+        confidence: finalAnalysis.confidence,
         provider: usedProvider,
-        fileName: analysis.fileName,
-        totalChanges: analysis.totalChanges,
+        fileName: finalAnalysis.fileName,
+        totalChanges: finalAnalysis.totalChanges,
         cacheHit: false
       }
     });
@@ -126,12 +149,12 @@ export async function POST(req: Request) {
 }
 
 // 🧠 INTELLIGENT AI STRATEGY EXECUTOR
-async function executeIntelligentAIStrategy(diff: string, analysis: any): Promise<{ result: string, provider: string }> {
+async function executeIntelligentAIStrategy(diff: string, analysis: DiffAnalysis): Promise<{ result: string; provider: string }> {
   // Get healthy providers sorted by priority
   const nowTs = Date.now();
   const healthyProviders = Object.entries(providerHealth)
     .filter(([key, health]) => health.isHealthy && health.consecutiveFailures < CIRCUIT_BREAKER_THRESHOLD && (!providerCooldownUntil[key] || providerCooldownUntil[key] < nowTs))
-    .sort(([_, a], [__, b]) => a.priority - b.priority);
+    .sort(([, a], [, b]) => a.priority - b.priority);
 
   console.log(`🧠 Intelligent routing: ${healthyProviders.length} healthy providers available`);
 
@@ -153,8 +176,8 @@ async function executeIntelligentAIStrategy(diff: string, analysis: any): Promis
     promises.push(executeWithRetry('huggingface', () => tryHuggingFaceModels(diff, analysis)));
   }
 
-  // Add Free Hugging Face (always available)
-  if (providerHealth.freehf.isHealthy) {
+  // Add Free Hugging Face (cheap models, uses HF token - $0.10 free credits/month)
+  if (process.env.HUGGING_FACE_TOKEN && providerHealth.freehf.isHealthy) {
     promises.push(executeWithRetry('freehf', () => tryFreeHuggingFace(diff, analysis)));
   }
 
@@ -171,12 +194,12 @@ async function executeIntelligentAIStrategy(diff: string, analysis: any): Promis
     updateProviderHealth(winner.provider, true);
     console.log(`✅ ${winner.provider} won the race!`);
     return winner;
-  } catch (_) {
+  } catch {
     console.log("🏁 All AI providers failed, falling back to intelligent local engine");
   }
 
   // 🧠 INTELLIGENT LOCAL FALLBACK (Local Pattern-Based Engine)
-  return { result: generateLocalPatternBasedCommit(diff, analysis), provider: 'local' };
+  return { result: generateLocalPatternBasedCommit(diff), provider: 'local' };
 }
 
 // 🔄 INTELLIGENT RETRY WITH CIRCUIT BREAKER
@@ -190,8 +213,15 @@ async function executeWithRetry(providerName: string, fn: () => Promise<string>)
       updateProviderHealth(providerName, true, responseTime);
       return { provider: providerName, result };
     } catch (error) {
-      console.log(`❌ ${providerName} attempt ${attempt} failed:`, error instanceof Error ? error.message : String(error));
-      
+      const errMsg = error instanceof Error ? error.message : String(error);
+      console.log(`❌ ${providerName} attempt ${attempt} failed:`, errMsg);
+
+      // 429 rate limit: pause provider for 5 min to avoid hammering
+      if (errMsg.includes('429')) {
+        providerCooldownUntil[providerName] = Date.now() + COOLDOWN_429_MS;
+        console.log(`⏸️ ${providerName} rate limited, cooldown until ${new Date(providerCooldownUntil[providerName]).toLocaleTimeString()}`);
+      }
+
       if (attempt === MAX_RETRIES) {
         updateProviderHealth(providerName, false);
         throw error;
@@ -228,178 +258,148 @@ function updateProviderHealth(providerName: string, success: boolean, responseTi
   }
 }
 
-// 🧠 Local Pattern-Based Engine (deterministic fallback)
-function generateLocalPatternBasedCommit(diff: string, analysis: any): string {
-  const { changeType, fileName, complexity, patterns } = analysis;
-  
-  // 🎯 CONTEXT-AWARE COMMIT GENERATION
-  const context = analyzeCommitContext(diff, analysis);
-  
-  // 🧠 INTELLIGENT TEMPLATE SELECTION
-  const templates = {
-    bugFix: () => generateBugFixCommit(fileName, context),
-    security: () => generateSecurityCommit(fileName, context),
-    performance: () => generatePerformanceCommit(fileName, context),
-    feature: () => generateFeatureCommit(fileName, context),
-    refactor: () => generateRefactorCommit(fileName, context),
-    styling: () => generateStylingCommit(fileName, context),
-    test: () => generateTestCommit(fileName, context),
-    docs: () => generateDocsCommit(fileName, context),
-    config: () => generateConfigCommit(fileName, context),
-    database: () => generateDatabaseCommit(fileName, context),
-    api: () => generateApiCommit(fileName, context),
-    chore: () => generateChoreCommit(fileName, context)
-  };
-  
-  const generator = templates[changeType as keyof typeof templates] || templates.chore;
-  return generator();
+// 🧠 Local Pattern-Based Engine (deterministic fallback) - works without any API
+function generateLocalPatternBasedCommit(diff: string): string {
+  // Use same parse+infer logic for both single and multi-file (accurate classification)
+  return generateMultiFileLocalCommit(diff);
 }
 
-// 🔍 ADVANCED CONTEXT ANALYSIS
-function analyzeCommitContext(diff: string, analysis: any) {
-  const lines = diff.split('\n');
-  const addedLines = lines.filter(line => line.startsWith('+')).map(line => line.substring(1));
-  const removedLines = lines.filter(line => line.startsWith('-')).map(line => line.substring(1));
-  
-  return {
-    addedLines,
-    removedLines,
-    fileType: analysis.fileExtension,
-    complexity: analysis.complexity,
-    patterns: analysis.patterns,
-    isNewFile: !removedLines.length && addedLines.length > 5,
-    isDeletion: !addedLines.length && removedLines.length > 0,
-    isModification: addedLines.length > 0 && removedLines.length > 0
-  };
-}
-
-// 🎯 INTELLIGENT COMMIT GENERATORS
-function generateFeatureCommit(fileName: string, context: any): string {
-  const isComponent = fileName.includes('component') || context.addedLines.some((line: string) => 
-    line.includes('const ') && line.includes('=') && line.includes('{')
-  );
-  
-  if (isComponent) {
-    return `feat: implement ${extractComponentName(fileName)} component
-
-- Add reusable component with props support
-- Implement interactive functionality
-- Enhance user experience with new features`;
+// 📂 PARSE MULTI-FILE DIFF into per-file chunks
+function parseDiffIntoFiles(diff: string): Array<{ fileName: string; addedLines: string[]; removedLines: string[]; content: string }> {
+  const chunks = diff.split(/(?=^diff --git )/m).filter(Boolean);
+  const files: Array<{ fileName: string; addedLines: string[]; removedLines: string[]; content: string }> = [];
+  for (const chunk of chunks) {
+    const m = chunk.match(/diff --git a\/([^\s]+)/);
+    if (!m) continue;
+    const fileName = m[1];
+    const added = chunk.split('\n').filter(l => l.startsWith('+')).map(l => l.substring(1));
+    const removed = chunk.split('\n').filter(l => l.startsWith('-')).map(l => l.substring(1));
+    files.push({ fileName, addedLines: added, removedLines: removed, content: chunk.toLowerCase() });
   }
-  
-  return `feat: add new functionality to ${fileName}
-
-- Implement new feature as requested
-- Add necessary components and logic
-- Enhance user experience`;
+  return files;
 }
 
-function generateBugFixCommit(fileName: string, context: any): string {
-  const hasValidation = context.addedLines.some((line: string) => 
-    line.includes('.trim()') || line.includes('validation') || line.includes('check')
-  );
-  
-  if (hasValidation) {
-    return `fix: improve validation in ${fileName}
+// 🎯 Infer change type from file content (order matters - more specific first)
+function inferChangeType(content: string, fileName: string, addedLines: string[], removedLines: string[]): string {
+  const added = addedLines.join(' ');
 
-- Add input sanitization to prevent edge cases
-- Handle whitespace and formatting issues
-- Improve data validation reliability`;
+  // Component/UI addition: path has "component" + adding const/export with props
+  if (/component|components/.test(fileName) && /const\s+\w+\s*=.*\(.*\).*=>|export\s+default/.test(added)) {
+    return 'feature';
   }
-  
-  return `fix: resolve issue in ${fileName}
+  // New component: const X = ({ ... }) => or export default X
+  if (/const\s+\w+\s*=\s*\(\s*\{[^}]*\}\s*\)\s*=>|export\s+default\s+\w+/.test(added) && addedLines.length > removedLines.length) {
+    return 'feature';
+  }
 
-- Address the problem identified in the code
-- Improve error handling and validation
-- Ensure proper functionality`;
+  const patterns: Array<[string, RegExp]> = [
+    ['bugFix', /\.trim\(\)|\.toLowerCase\(\)|\.toUpperCase\(\)|null|undefined|error|exception|catch|try|fix|bug/i],
+    ['security', /password|auth|token|secret|key|encrypt|decrypt|hash|salt|jwt|oauth/i],
+    ['performance', /optimize|performance|speed|memory|cache|lazy|memo|debounce|throttle/i],
+    ['refactor', /axios|apiClient|restructure|reorganize|replace\s+\w+\s+with/i],
+    ['api', /api|endpoint|route|controller|service|fetch|\.get\(|\.post\(/i],
+    ['test', /test|spec|describe|it\(|expect|assert/i],
+    ['styling', /style|className|class=|color|font|margin|padding|css/i],
+    ['config', /package\.json|dependencies|webpack|babel|eslint|tsconfig/i],
+    ['database', /sql|query|database|db|migration|schema|table|index/i],
+    ['docs', /readme|\.md|doc|comment|\/\//i],
+    ['feature', /const\s+\w+\s*=|function\s+\w+|export\s+default|component|interface|class\s+\w+/i],
+  ];
+  for (const [type, re] of patterns) {
+    if (re.test(content)) return type;
+  }
+  if (addedLines.length > removedLines.length + 3) return 'feature';
+  if (removedLines.length > addedLines.length + 3) return 'chore';
+  return 'chore';
 }
 
-function generateRefactorCommit(fileName: string, context: any): string {
-  return `refactor: improve code structure in ${fileName}
+// 🎯 Context-aware description inference from actual code changes
+function inferDescription(fileName: string, addedLines: string[], removedLines: string[], changeType: string): string {
+  const added = addedLines.join(' ');
+  const removed = removedLines.join(' ');
+  const baseName = fileName.split('/').pop() || fileName;
+  const baseNoExt = baseName.replace(/\.(js|jsx|ts|tsx|vue)$/, '');
 
-- Clean up code organization
-- Optimize performance and readability
-- Maintain existing functionality`;
+  if (changeType === 'bugFix') {
+    if (/\.trim\(\)/.test(added)) return `trim input before validation in ${baseName}`;
+    if (/validation|validate/.test(added) || /validation|validate/.test(fileName)) return `improve validation in ${baseName}`;
+    if (/catch|try|error/.test(added)) return `add error handling in ${baseName}`;
+    if (/null|undefined/.test(added)) return `add null/undefined check in ${baseName}`;
+    return `fix issue in ${baseName}`;
+  }
+  if (changeType === 'refactor' || changeType === 'api') {
+    if (/axios/.test(removed) && /apiClient|fetch/.test(added)) return `replace axios with apiClient in ${baseName}`;
+    if (/import.*from/.test(added) && /import.*from/.test(removed)) return `update imports in ${baseName}`;
+    return `refactor ${baseName}`;
+  }
+  if (changeType === 'feature') {
+    const componentMatch = added.match(/const\s+(\w+)\s*=\s*\(|export\s+default\s+(\w+)|class\s+(\w+)\s+extends/);
+    const compName = componentMatch ? (componentMatch[1] || componentMatch[2] || componentMatch[3] || baseNoExt) : baseNoExt;
+    if (/component/.test(fileName) || /const\s+\w+\s*=.*=>|export\s+default/.test(added)) {
+      if (/variant|onClick|children|props|className/.test(added)) return `add ${compName} component with props support`;
+      return `add ${compName} component`;
+    }
+    if (/export\s+(const|function|default|class)/.test(added)) return `add ${baseNoExt}`;
+    if (addedLines.length > removedLines.length + 2) return `add functionality to ${baseName}`;
+    return `add ${baseNoExt}`;
+  }
+  if (changeType === 'test') return `add tests for ${baseNoExt}`;
+  if (changeType === 'config') return `update config in ${baseName}`;
+  if (changeType === 'styling') return `update styling in ${baseName}`;
+  if (changeType === 'docs') return `update docs in ${baseName}`;
+  if (baseName.endsWith('.txt') && addedLines.length === 1) {
+    const line = addedLines[0].trim();
+    if (line && line.length < 50) return `add ${line} to ${baseName}`;
+  }
+  if (removedLines.length > addedLines.length + 2) return `remove code from ${baseName}`;
+  return `update ${baseName}`;
 }
 
-function generateStylingCommit(fileName: string, context: any): string {
-  return `style: update formatting and styling
-
-- Apply consistent code formatting
-- Fix linting issues
-- Improve code readability`;
+// 🎯 Build subject line for multi-file (short summary)
+function buildMultiFileSubject(fileAnalyses: Array<{ changeType: string; desc: string; baseName?: string }>): string {
+  const typeMap: Record<string, string> = { bugFix: 'fix', feature: 'feat', refactor: 'refactor', api: 'refactor', chore: 'chore', test: 'test', config: 'chore', styling: 'style', docs: 'docs' };
+  const types = [...new Set(fileAnalyses.map(f => f.changeType))];
+  if (types.length === 1) {
+    return `${typeMap[types[0]] || 'chore'}: ${fileAnalyses.length} files`;
+  }
+  const names = fileAnalyses.map(a => a.baseName || a.desc.split(' ').pop() || 'file');
+  const subj = `chore: ${names.join(', ')}`;
+  return subj.length <= 72 ? subj : `chore: update ${fileAnalyses.length} files`;
 }
 
-function generateTestCommit(fileName: string, context: any): string {
-  return `test: add test coverage for ${fileName}
-
-- Add comprehensive test cases
-- Ensure proper test coverage
-- Validate functionality`;
+// Extract analysis metadata from local engine (for response when provider is 'local')
+function getLocalAnalysis(diff: string): { changeType: string; fileName: string; confidence: number } {
+  const files = parseDiffIntoFiles(diff);
+  if (files.length === 0) return { changeType: 'chore', fileName: 'unknown', confidence: 0.8 };
+  const f = files[0];
+  const changeType = inferChangeType(f.content, f.fileName, f.addedLines, f.removedLines);
+  return { changeType, fileName: f.fileName, confidence: 0.9 };
 }
 
-function generateDocsCommit(fileName: string, context: any): string {
-  return `docs: update documentation
-
-- Improve code documentation
-- Add helpful comments and examples
-- Update README and guides`;
-}
-
-function generateConfigCommit(fileName: string, context: any): string {
-  return `chore: update configuration and dependencies
-
-- Update package dependencies
-- Modify configuration settings
-- Maintain project setup`;
-}
-
-function generateDatabaseCommit(fileName: string, context: any): string {
-  return `db: update database schema or queries
-
-- Modify database structure or queries
-- Improve data handling and storage
-- Optimize database performance`;
-}
-
-function generateApiCommit(fileName: string, context: any): string {
-  return `api: update API endpoints or services
-
-- Modify API functionality
-- Improve request/response handling
-- Enhance service integration`;
-}
-
-function generateSecurityCommit(fileName: string, context: any): string {
-  return `security: enhance security in ${fileName}
-
-- Implement security improvements
-- Address potential vulnerabilities
-- Strengthen authentication/authorization`;
-}
-
-function generatePerformanceCommit(fileName: string, context: any): string {
-  return `perf: optimize performance in ${fileName}
-
-- Improve code efficiency and speed
-- Reduce memory usage and processing time
-- Enhance overall application performance`;
-}
-
-function generateChoreCommit(fileName: string, context: any): string {
-  return `chore: update ${fileName}
-
-- Make necessary changes to improve functionality
-- Update code as required
-- Maintain project standards`;
+// 🎯 Generate powerful multi-file local commit
+function generateMultiFileLocalCommit(diff: string): string {
+  const files = parseDiffIntoFiles(diff);
+  if (files.length === 0) return 'chore: update files';
+  if (files.length === 1) {
+    const f = files[0];
+    const changeType = inferChangeType(f.content, f.fileName, f.addedLines, f.removedLines);
+    const desc = inferDescription(f.fileName, f.addedLines, f.removedLines, changeType);
+    const typeMap: Record<string, string> = { bugFix: 'fix', feature: 'feat', refactor: 'refactor', api: 'refactor', chore: 'chore', test: 'test', config: 'chore', styling: 'style', docs: 'docs' };
+    const type = typeMap[changeType] || 'chore';
+    return `${type}: ${desc}`;
+  }
+  const analyses = files.map(f => {
+    const changeType = inferChangeType(f.content, f.fileName, f.addedLines, f.removedLines);
+    const desc = inferDescription(f.fileName, f.addedLines, f.removedLines, changeType);
+    const baseName = f.fileName.split('/').pop() || f.fileName;
+    return { changeType, desc, baseName };
+  });
+  const subject = buildMultiFileSubject(analyses);
+  const bullets = analyses.map(a => `- ${a.desc}`);
+  return `${subject}\n\n${bullets.join('\n')}`;
 }
 
 // 🔧 UTILITY FUNCTIONS
-function extractComponentName(fileName: string): string {
-  const name = fileName.split('/').pop()?.replace(/\.(js|jsx|ts|tsx)$/, '') || 'component';
-  return name.charAt(0).toUpperCase() + name.slice(1);
-}
-
 function generateCacheKey(diff: string): string {
   // Create a hash of the diff for caching
   let hash = 0;
@@ -508,24 +508,38 @@ function analyzeDiff(diff: string) {
   };
 }
 
-// AI Provider Functions (Enhanced with better error handling)
-async function tryOpenAI(diff: string, analysis: any): Promise<string> {
-  const prompt = `You are an expert programmer. Generate a conventional commit message for this git diff.
+// Shared prompt: concise, git-standard output (good for GitHub/git)
+function buildCommitPrompt(diff: string, analysis: DiffAnalysis): string {
+  const multi = (analysis.fileCount ?? 1) > 1;
+  const multiNote = multi
+    ? `\nIMPORTANT: ${analysis.fileCount ?? 0} files changed. Use this EXACT format:
+Subject line (max 50 chars, short summary)
+(blank line)
+- First file: what changed
+- Second file: what changed
+- etc. - one bullet per file, cover ALL files
+\n`
+    : '';
+  return `Generate a git commit message for this diff.
+${multiNote}
+File(s): ${analysis.fileName}${multi ? ` (${analysis.fileCount ?? 0} files)` : ''}
 
-File: ${analysis.fileName}
-Change Type: ${analysis.changeType}
-Complexity: ${analysis.complexity}
-
-Git Diff:
+Diff:
 ${diff}
 
-Requirements:
-1. Use conventional commit format (type: description)
-2. Keep subject line under 50 characters
-3. Add body explaining what and why
-4. Be specific and professional
+Rules:
+- Conventional: type: description (feat, fix, refactor, chore)
+- Subject max 50 chars. Use imperative. Multi-file: short subject, then bullets
+- Output ONLY the message. No preamble, no backticks.`;
+}
 
-Commit Message:`;
+function getMaxTokens(analysis: DiffAnalysis): number {
+  return (analysis.fileCount ?? 1) > 1 ? 220 : 100;
+}
+
+// AI Provider Functions (Enhanced with better error handling)
+async function tryOpenAI(diff: string, analysis: DiffAnalysis): Promise<string> {
+  const prompt = buildCommitPrompt(diff, analysis);
 
   const response = await fetchWithTimeout(OPENAI_API_URL, OPENAI_TIMEOUT, {
     method: 'POST',
@@ -536,7 +550,7 @@ Commit Message:`;
     body: JSON.stringify({
       model: 'gpt-3.5-turbo',
       messages: [{ role: 'user', content: prompt }],
-      max_tokens: 150,
+      max_tokens: getMaxTokens(analysis),
       temperature: 0.7,
     }),
   });
@@ -547,23 +561,8 @@ Commit Message:`;
   return data.choices[0]?.message?.content?.trim() || '';
 }
 
-async function tryAIML(diff: string, analysis: any): Promise<string> {
-  const prompt = `You are an expert programmer. Generate a conventional commit message for this git diff.
-
-File: ${analysis.fileName}
-Change Type: ${analysis.changeType}
-Complexity: ${analysis.complexity}
-
-Git Diff:
-${diff}
-
-Requirements:
-1. Use conventional commit format (type: description)
-2. Keep subject line under 50 characters
-3. Add body explaining what and why
-4. Be specific and professional
-
-Commit Message:`;
+async function tryAIML(diff: string, analysis: DiffAnalysis): Promise<string> {
+  const prompt = buildCommitPrompt(diff, analysis);
 
   const response = await fetchWithTimeout(AIML_API_URL, AIML_TIMEOUT, {
     method: 'POST',
@@ -572,14 +571,14 @@ Commit Message:`;
       'Authorization': `Bearer ${process.env.AIML_API_KEY}`,
     },
     body: JSON.stringify({
-      model: "google/gemma-2-2b-it",
+      model: "google/gemma-3-4b-it", // Free tier on AIML
       messages: [
         {
           role: "user",
           content: prompt
         }
       ],
-      max_tokens: 150,
+      max_tokens: getMaxTokens(analysis),
       temperature: 0.5
     }),
   });
@@ -598,23 +597,8 @@ Commit Message:`;
   return content;
 }
 
-async function tryGemini(diff: string, analysis: any): Promise<string> {
-  const prompt = `You are an expert programmer. Generate a conventional commit message for this git diff.
-
-File: ${analysis.fileName}
-Change Type: ${analysis.changeType}
-Complexity: ${analysis.complexity}
-
-Git Diff:
-${diff}
-
-Requirements:
-1. Use conventional commit format (type: description)
-2. Keep subject line under 50 characters
-3. Add body explaining what and why
-4. Be specific and professional
-
-Commit Message:`;
+async function tryGemini(diff: string, analysis: DiffAnalysis): Promise<string> {
+  const prompt = buildCommitPrompt(diff, analysis);
 
   const response = await fetchWithTimeout(GEMINI_API_URL, GEMINI_TIMEOUT, {
     method: 'POST',
@@ -633,8 +617,8 @@ Commit Message:`;
         }
       ],
       generationConfig: {
-        maxOutputTokens: 150,
-        temperature: 0.7,
+        maxOutputTokens: getMaxTokens(analysis),
+        temperature: 0.6,
       }
     }),
   });
@@ -642,115 +626,58 @@ Commit Message:`;
   if (!response.ok) throw new Error(`Gemini API error: ${response.status}`);
   
   const data = await response.json();
-  return data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '';
+  // Join ALL parts (Gemini can split response; 2.5-flash also has truncation bug)
+  const parts = data.candidates?.[0]?.content?.parts ?? [];
+  const fullText = parts.map((p: { text?: string }) => p.text || '').join('').trim();
+  return fullText || '';
 }
 
-async function tryFreeHuggingFace(diff: string, analysis: any): Promise<string> {
-  // Try different free models
+// HF Router - cheap models (uses fewer credits from $0.10/month free tier)
+async function tryFreeHuggingFace(diff: string, analysis: DiffAnalysis): Promise<string> {
+  const prompt = buildCommitPrompt(diff, analysis);
+
   for (const model of FREE_HF_MODELS) {
     try {
-      const prompt = `Generate commit message for: ${diff.substring(0, 500)}`;
-      
-      const response = await fetchWithTimeout(`https://api-inference.huggingface.co/models/${model}`, HF_TIMEOUT, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          inputs: prompt,
-          parameters: {
-            max_new_tokens: 100,
-            temperature: 0.7,
-            return_full_text: false,
-          },
-        }),
-      });
-
-      if (response.ok) {
-        const data = await response.json();
-        const generatedText = (Array.isArray(data) ? data[0]?.generated_text : (data?.generated_text || data?.text))?.trim() || '';
-        if (generatedText) {
-          // Clean up the response
-          const cleaned = generatedText
-            .replace(prompt, '')
-            .trim()
-            .split('\n')[0]; // Take first line
-          
-          if (cleaned.length > 10) {
-            return cleaned;
-          }
-        }
-      }
-    } catch (error) {
-      // Try next model
-      continue;
-    }
-  }
-  
-  throw new Error('All free models failed');
-}
-
-async function tryHuggingFace(diff: string, analysis: any): Promise<string> {
-  const prompt = `Generate a conventional commit message for this git diff:
-
-${diff}
-
-Format: type: short description
-
-Body:
-- What changed
-- Why it changed
-
-Commit message:`;
-
-  const response = await fetchWithTimeout(HUGGING_FACE_API_URL, HF_TIMEOUT, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${process.env.HUGGING_FACE_TOKEN}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      inputs: prompt,
-      parameters: {
-        max_new_tokens: 150,
-        temperature: 0.7,
-        return_full_text: false,
-      },
-    }),
-  });
-
-  if (!response.ok) {
-    if (response.status === 403 || response.status === 404) {
-      throw new Error(`Hugging Face API error: ${response.status} (model unavailable or access required)`);
-    }
-    throw new Error(`Hugging Face API error: ${response.status}`);
-  }
-  
-  const data = await response.json();
-  const text = (Array.isArray(data) ? data[0]?.generated_text : (data?.generated_text || data?.text))?.trim() || '';
-  return text;
-}
-
-// Try multiple HF models (token required) in the preferred order
-async function tryHuggingFaceModels(diff: string, analysis: any): Promise<string> {
-  let lastError: any = null;
-  for (const model of HUGGING_FACE_MODEL_ORDER) {
-    try {
-      const url = `https://api-inference.huggingface.co/models/${model}`;
-      const prompt = `Generate a conventional commit message for this git diff:\n\n${diff}\n\nFormat: type: short description\n\nBody:\n- What changed\n- Why it changed\n\nCommit message:`;
-      const response = await fetchWithTimeout(url, HF_TIMEOUT, {
+      const response = await fetchWithTimeout(HF_ROUTER_URL, HF_TIMEOUT, {
         method: 'POST',
         headers: {
           'Authorization': `Bearer ${process.env.HUGGING_FACE_TOKEN}`,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          inputs: prompt,
-          parameters: {
-            max_new_tokens: 150,
-            temperature: 0.5,
-            return_full_text: false,
-          },
+          model,
+          messages: [{ role: 'user', content: prompt }],
+          max_tokens: getMaxTokens(analysis),
+          temperature: 0.6,
+        }),
+      });
+      if (!response.ok) continue;
+      const data = await response.json();
+      const text = data.choices?.[0]?.message?.content?.trim() || '';
+      if (text.length > 10) return text;
+    } catch { continue; }
+  }
+  throw new Error('All free HF models failed');
+}
+
+// HF Inference Providers (router.huggingface.co) - OpenAI-compatible chat completions
+async function tryHuggingFaceModels(diff: string, analysis: DiffAnalysis): Promise<string> {
+  const prompt = buildCommitPrompt(diff, analysis);
+
+  let lastError: Error | null = null;
+  for (const model of HUGGING_FACE_MODEL_ORDER) {
+    try {
+      const response = await fetchWithTimeout(HF_ROUTER_URL, HF_TIMEOUT, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${process.env.HUGGING_FACE_TOKEN}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model,
+          messages: [{ role: 'user', content: prompt }],
+          max_tokens: getMaxTokens(analysis),
+          temperature: 0.6,
         }),
       });
       if (!response.ok) {
@@ -758,10 +685,10 @@ async function tryHuggingFaceModels(diff: string, analysis: any): Promise<string
         continue;
       }
       const data = await response.json();
-      const text = (Array.isArray(data) ? data[0]?.generated_text : (data?.generated_text || data?.text))?.trim() || '';
+      const text = data.choices?.[0]?.message?.content?.trim() || '';
       if (text) return text;
     } catch (e) {
-      lastError = e;
+      lastError = e instanceof Error ? e : new Error(String(e));
       continue;
     }
   }
@@ -769,7 +696,7 @@ async function tryHuggingFaceModels(diff: string, analysis: any): Promise<string
 }
 
 // Utility function for timeout
-function fetchWithTimeout(url: string, timeout: number, options: any): Promise<Response> {
+function fetchWithTimeout(url: string, timeout: number, options: RequestInit): Promise<Response> {
   return Promise.race([
     fetch(url, options),
     new Promise<Response>((_, reject) =>
@@ -795,4 +722,57 @@ function redactSecrets(input: string): string {
     out = out.replace(re, '[REDACTED]');
   }
   return out;
+}
+
+// Strip preamble/meta lines (e.g. "This commit message follows...", "Type: feat", "Subject: ...")
+function isMetaLine(line: string): boolean {
+  const t = line.toLowerCase();
+  return (
+    /^this commit message|^type:\s*(feat|fix|refactor|etc)/i.test(t) ||
+    /^subject:|^description:|^body:/i.test(t) ||
+    /conventional (guidelines|commit|format)/i.test(t) ||
+    /^(imperative|within the \d+ char limit|a short description)/i.test(t) ||
+    /^rules?:|^output only|^no preamble/i.test(t)
+  );
+}
+
+// Sanitize AI output: extract clean commit message (concise, no preamble/backticks)
+function sanitizeCommitMessage(raw: string, diff?: string): string {
+  if (!raw?.trim()) return raw || '';
+  const s = raw
+    .replace(/```\w*\n?/g, '')
+    .replace(/```/g, '')
+    .replace(/`([^`]+)`/g, '$1')
+    .trim();
+  // Strip leading preamble before conventional line
+  const conventionalMatch = s.match(/(feat|fix|refactor|chore|style|test|docs|perf|ci|build)(\([^)]*\))?!?:\s*[^\n]+/i);
+  if (conventionalMatch) {
+    const subject = conventionalMatch[0].trim();
+    const rest = s.slice(s.indexOf(subject) + subject.length).trim();
+    const bodyLines = rest.split(/\r?\n/).map(l => l.replace(/^[-*]\s*/, '').trim())
+      .filter(l => l.length > 2)
+      .filter(l => !/^(here|the|commit|body):?\s*$/i.test(l))
+      .filter(l => !isMetaLine(l));
+    const truncateAtWord = (str: string, max: number) => str.length <= max ? str : (str.slice(0, max).replace(/\s+\S*$/, '') || str.slice(0, max));
+    let finalSubject = truncateAtWord(subject, 72);
+    // Correct feat→fix when diff shows bug-fix (.trim in validation, null check, etc.)
+    if (diff && /^feat:/i.test(finalSubject) && /\.trim\(\)|\.toLowerCase\(\)|\.toUpperCase\(\)|validation|validate|null\s*[=!]|undefined\s*[=!]|catch\s*\(|error\s*handling/i.test(diff)) {
+      finalSubject = finalSubject.replace(/^feat:/i, 'fix:');
+    }
+    if (bodyLines.length) return `${finalSubject}\n\n${bodyLines.slice(0, 5).map(l => truncateAtWord(l, 72)).join('\n')}`;
+    return finalSubject;
+  }
+  const lines = s.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  const skip = /^(here'?s?\s|here is\s|the commit message|commit message:|body:)\s*$/i;
+  const valid = lines.filter(l => !skip.test(l)).map(l => /^[-*]\s/.test(l) ? l.slice(2).trim() : l);
+  if (valid.length === 0) return s;
+  const truncateAtWord = (str: string, max: number) => {
+    if (str.length <= max) return str;
+    const cut = str.slice(0, max);
+    const lastSpace = cut.lastIndexOf(' ');
+    return lastSpace > 40 ? cut.slice(0, lastSpace) : cut;
+  };
+  const subject = truncateAtWord(valid[0], 72);
+  const body = valid.slice(1, 6).map(l => truncateAtWord(l, 72)).filter(Boolean);
+  return body.length ? [subject, '', ...body].join('\n') : subject;
 }

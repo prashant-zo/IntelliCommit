@@ -2,7 +2,7 @@
 
 import { useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { GitBranch, Sparkles, Copy, Check, ArrowLeft, Wand2, LoaderCircle } from 'lucide-react';
+import { GitBranch, Sparkles, Copy, Check, ArrowLeft, Wand2 } from 'lucide-react';
 import Link from 'next/link';
 
 export default function DiffPage() {
