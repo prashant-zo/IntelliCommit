@@ -30,8 +30,22 @@ yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
 
-# env files (can opt-in for committing if needed)
+# env files (secrets - never commit)
 .env*
+!.env.example
+
+# generated / output
+simulation-results.json
+*.log
+
+# project docs (not for repo)
+AI-commit-4-yr.pdf
+research-paper.md
+
+# IDE / OS
+.idea/
+.vscode/
+Thumbs.db
 
 # vercel
 .vercel
@@ -39,3 +53,4 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
